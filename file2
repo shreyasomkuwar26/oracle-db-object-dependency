@@ -1,0 +1,932 @@
+/******************************************************************************
+ * PACKAGE : PKG_MASTER_LOAD
+ * PURPOSE : Loads delta/full data from staging/landing tables into the
+ *           Master layer, maintaining SCD Type 2 history for all 7 tables:
+ *             M_PRODUCT, M_CATEGORY, M_SUB_CATEGORY, M_SUPPLIER,
+ *             M_SUPPLIER_ADDR, M_BRAND, M_UOM
+ *
+ * CHANGE DETECTION : Row hash (STANDARD_HASH SHA256) on all Master columns.
+ *                    A separate dim_contributing_hash covers only columns
+ *                    that flow into DIM_PRODUCT, preventing spurious DIM
+ *                    fan-outs when non-DIM Master columns change.
+ *
+ * STAGING TABLES (pre-loaded from CSV before this package runs):
+ *   STG_PRODUCT, STG_CATEGORY, STG_SUB_CATEGORY, STG_SUPPLIER,
+ *   STG_SUPPLIER_ADDR, STG_BRAND, STG_UOM
+ *
+ * CONTROL TABLES:
+ *   DW_BATCH_CONTROL      - Status per batch_id / file_date / layer
+ *   DW_MASTER_CHANGE_LOG  - Natural keys changed per batch (feeds DIM fan-out)
+ *   DW_LOAD_LOG           - Operational logging
+ *
+ * PUBLIC PROCEDURES:
+ *   LOAD_ALL_MASTERS_FOR_DATE  - Normal daily entry point
+ *   CATCHUP_MASTER_LOAD        - Scenario 1: process missed file dates
+ *   REPLAY_MASTER_FROM_DATE    - Scenario 2: rollback + replay from a date
+ *
+ * AUTHOR : <Your Name>
+ * DATE   : 2024
+ ******************************************************************************/
+
+CREATE OR REPLACE PACKAGE PKG_MASTER_LOAD AS
+
+    PROCEDURE LOAD_ALL_MASTERS_FOR_DATE (
+        p_file_date  IN DATE,
+        p_batch_id   IN NUMBER,
+        p_load_type  IN VARCHAR2 DEFAULT 'DELTA'  -- FULL or DELTA
+    );
+
+    PROCEDURE CATCHUP_MASTER_LOAD (
+        p_from_date  IN DATE DEFAULT NULL,
+        p_to_date    IN DATE DEFAULT TRUNC(SYSDATE)
+    );
+
+    PROCEDURE REPLAY_MASTER_FROM_DATE (
+        p_from_date  IN DATE,
+        p_to_date    IN DATE DEFAULT TRUNC(SYSDATE)
+    );
+
+END PKG_MASTER_LOAD;
+/
+
+
+CREATE OR REPLACE PACKAGE BODY PKG_MASTER_LOAD AS
+
+    -- =========================================================================
+    -- PRIVATE CONSTANTS
+    -- =========================================================================
+    C_HIGH_DATE     CONSTANT DATE        := DATE '9999-12-31';
+    C_MASTER_LAYER  CONSTANT VARCHAR2(20) := 'MASTER';
+    C_STG_LAYER     CONSTANT VARCHAR2(20) := 'STAGING';
+    C_STATUS_DONE   CONSTANT VARCHAR2(20) := 'COMPLETED';
+    C_STATUS_FAIL   CONSTANT VARCHAR2(20) := 'FAILED';
+    C_STATUS_PEND   CONSTANT VARCHAR2(20) := 'PENDING';
+    C_STATUS_RUN    CONSTANT VARCHAR2(20) := 'RUNNING';
+    -- CHR(1) as delimiter: non-printable, safe against any source data value
+    C_DELIM         CONSTANT VARCHAR2(1)  := CHR(1);
+    -- Sentinel replaces NULL in hash concatenation to distinguish NULL from ''
+    C_NULL_SEN      CONSTANT VARCHAR2(10) := '~NULL~';
+
+    -- =========================================================================
+    -- PRIVATE: Autonomous transaction logger
+    -- =========================================================================
+    PROCEDURE LOG_MSG (
+        p_batch_id IN NUMBER,
+        p_proc     IN VARCHAR2,
+        p_msg      IN VARCHAR2,
+        p_severity IN VARCHAR2 DEFAULT 'INFO'
+    ) IS
+        PRAGMA AUTONOMOUS_TRANSACTION;
+    BEGIN
+        INSERT INTO DW_LOAD_LOG (
+            log_id, batch_id, layer, procedure_name,
+            log_message, severity, log_timestamp
+        ) VALUES (
+            DW_LOAD_LOG_SEQ.NEXTVAL, p_batch_id, C_MASTER_LAYER,
+            p_proc, SUBSTR(p_msg,1,4000), p_severity, SYSTIMESTAMP
+        );
+        COMMIT;
+    EXCEPTION WHEN OTHERS THEN NULL;
+    END LOG_MSG;
+
+    -- =========================================================================
+    -- PRIVATE: Upsert batch control status
+    -- =========================================================================
+    PROCEDURE UPDATE_BATCH_STATUS (
+        p_batch_id   IN NUMBER,
+        p_file_date  IN DATE,
+        p_status     IN VARCHAR2,
+        p_rows       IN NUMBER   DEFAULT 0,
+        p_error      IN VARCHAR2 DEFAULT NULL
+    ) IS
+    BEGIN
+        MERGE INTO DW_BATCH_CONTROL tgt
+        USING (SELECT p_batch_id AS batch_id, p_file_date AS file_date,
+                      C_MASTER_LAYER AS layer FROM DUAL) src
+        ON (tgt.batch_id = src.batch_id AND tgt.file_date = src.file_date
+            AND tgt.layer = src.layer)
+        WHEN MATCHED THEN UPDATE SET
+            tgt.status         = p_status,
+            tgt.rows_processed = p_rows,
+            tgt.error_message  = SUBSTR(p_error,1,4000),
+            tgt.updated_ts     = SYSTIMESTAMP
+        WHEN NOT MATCHED THEN INSERT (
+            batch_id, file_date, layer, status,
+            rows_processed, error_message, created_ts, updated_ts
+        ) VALUES (
+            p_batch_id, p_file_date, C_MASTER_LAYER, p_status,
+            p_rows, SUBSTR(p_error,1,4000), SYSTIMESTAMP, SYSTIMESTAMP
+        );
+    END UPDATE_BATCH_STATUS;
+
+    -- =========================================================================
+    -- PRIVATE: NULL-safe hash helpers
+    -- =========================================================================
+    FUNCTION H (p_val IN VARCHAR2) RETURN VARCHAR2 IS
+    BEGIN RETURN NVL(p_val, C_NULL_SEN); END H;
+
+    FUNCTION H (p_val IN DATE) RETURN VARCHAR2 IS
+    BEGIN RETURN NVL(TO_CHAR(p_val,'YYYY-MM-DD'), C_NULL_SEN); END H;
+
+    FUNCTION H (p_val IN NUMBER) RETURN VARCHAR2 IS
+    BEGIN RETURN NVL(TO_CHAR(p_val), C_NULL_SEN); END H;
+
+    -- =========================================================================
+    -- PRIVATE: LOAD_M_CATEGORY
+    -- Reference table loaded first; M_PRODUCT depends on it.
+    -- DIM columns: category_name, category_description, category_status
+    -- Non-DIM columns: category_manager (internal, excluded from DIM hash)
+    -- =========================================================================
+    PROCEDURE LOAD_M_CATEGORY (
+        p_file_date IN DATE,
+        p_batch_id  IN NUMBER,
+        p_load_type IN VARCHAR2,
+        p_rows_out  OUT NUMBER
+    ) IS
+        v_proc     CONSTANT VARCHAR2(50) := 'LOAD_M_CATEGORY';
+        v_expired  NUMBER := 0;
+        v_inserted NUMBER := 0;
+    BEGIN
+        LOG_MSG(p_batch_id, v_proc, 'START file_date=' || TO_CHAR(p_file_date,'YYYY-MM-DD'));
+
+        -- Full load: logically delete categories absent from today's file
+        IF p_load_type = 'FULL' THEN
+            UPDATE M_CATEGORY SET
+                effective_end_date = p_file_date, is_current = 'N',
+                dw_update_ts = SYSTIMESTAMP, expired_by_batch = p_batch_id
+            WHERE effective_end_date = C_HIGH_DATE AND is_current = 'Y'
+              AND NOT EXISTS (SELECT 1 FROM STG_CATEGORY s
+                              WHERE s.category_code = M_CATEGORY.category_code);
+            LOG_MSG(p_batch_id, v_proc, 'FULL: soft-deleted ' || SQL%ROWCOUNT);
+        END IF;
+
+        -- Expire records whose full row hash has changed
+        UPDATE M_CATEGORY mc SET
+            mc.effective_end_date = p_file_date, mc.is_current = 'N',
+            mc.dw_update_ts = SYSTIMESTAMP, mc.expired_by_batch = p_batch_id
+        WHERE mc.effective_end_date = C_HIGH_DATE AND mc.is_current = 'Y'
+          AND EXISTS (
+              SELECT 1 FROM STG_CATEGORY s
+              WHERE s.category_code = mc.category_code
+                AND STANDARD_HASH(
+                    H(s.category_name)        || C_DELIM ||
+                    H(s.category_description) || C_DELIM ||
+                    H(s.category_manager)     || C_DELIM ||
+                    H(s.category_status), 'SHA256') != mc.row_hash);
+        v_expired := SQL%ROWCOUNT;
+
+        -- Insert new versions for changed + new records
+        INSERT INTO M_CATEGORY (
+            category_sk, category_code, category_name, category_description,
+            category_manager, category_status,
+            row_hash, dim_contributing_hash,
+            effective_start_date, effective_end_date, is_current,
+            source_batch_id, source_file_date, dw_insert_ts, dw_update_ts
+        )
+        SELECT M_CATEGORY_SK_SEQ.NEXTVAL,
+            s.category_code, s.category_name, s.category_description,
+            s.category_manager, s.category_status,
+            STANDARD_HASH(H(s.category_name) || C_DELIM || H(s.category_description)
+                       || C_DELIM || H(s.category_manager) || C_DELIM
+                       || H(s.category_status), 'SHA256'),
+            -- DIM hash excludes category_manager (not surfaced in DIM)
+            STANDARD_HASH(H(s.category_name) || C_DELIM || H(s.category_description)
+                       || C_DELIM || H(s.category_status), 'SHA256'),
+            p_file_date, C_HIGH_DATE, 'Y',
+            p_batch_id, p_file_date, SYSTIMESTAMP, SYSTIMESTAMP
+        FROM STG_CATEGORY s
+        WHERE NOT EXISTS (SELECT 1 FROM M_CATEGORY mc
+                          WHERE mc.category_code = s.category_code
+                            AND mc.effective_end_date = C_HIGH_DATE
+                            AND mc.is_current = 'Y');
+        v_inserted := SQL%ROWCOUNT;
+
+        -- Log DIM-visible changes for fan-out resolver in PKG_DIM_LOAD
+        INSERT INTO DW_MASTER_CHANGE_LOG (
+            batch_id, file_date, master_table, natural_key, change_type, logged_ts)
+        SELECT p_batch_id, p_file_date, 'M_CATEGORY', n.category_code,
+               CASE WHEN o.category_code IS NULL THEN 'INSERT' ELSE 'UPDATE' END,
+               SYSTIMESTAMP
+        FROM M_CATEGORY n
+        LEFT JOIN M_CATEGORY o
+            ON o.category_code = n.category_code
+           AND o.effective_end_date = p_file_date AND o.expired_by_batch = p_batch_id
+        WHERE n.source_batch_id = p_batch_id AND n.effective_end_date = C_HIGH_DATE
+          -- Only log when DIM-contributing columns changed; skip internal-only changes
+          AND (o.category_code IS NULL
+               OR o.dim_contributing_hash != n.dim_contributing_hash);
+
+        COMMIT;
+        p_rows_out := v_inserted;
+        LOG_MSG(p_batch_id, v_proc, 'END expired='||v_expired||' inserted='||v_inserted);
+    EXCEPTION WHEN OTHERS THEN
+        ROLLBACK;
+        LOG_MSG(p_batch_id, v_proc, 'FAILED: '||SQLERRM, 'ERROR'); RAISE;
+    END LOAD_M_CATEGORY;
+
+    -- =========================================================================
+    -- PRIVATE: LOAD_M_SUB_CATEGORY
+    -- DIM columns: sub_category_name, sub_category_description, category_code, status
+    -- =========================================================================
+    PROCEDURE LOAD_M_SUB_CATEGORY (
+        p_file_date IN DATE,
+        p_batch_id  IN NUMBER,
+        p_load_type IN VARCHAR2,
+        p_rows_out  OUT NUMBER
+    ) IS
+        v_proc     CONSTANT VARCHAR2(50) := 'LOAD_M_SUB_CATEGORY';
+        v_expired  NUMBER := 0;
+        v_inserted NUMBER := 0;
+    BEGIN
+        LOG_MSG(p_batch_id, v_proc, 'START file_date=' || TO_CHAR(p_file_date,'YYYY-MM-DD'));
+
+        IF p_load_type = 'FULL' THEN
+            UPDATE M_SUB_CATEGORY SET
+                effective_end_date = p_file_date, is_current = 'N',
+                dw_update_ts = SYSTIMESTAMP, expired_by_batch = p_batch_id
+            WHERE effective_end_date = C_HIGH_DATE AND is_current = 'Y'
+              AND NOT EXISTS (SELECT 1 FROM STG_SUB_CATEGORY s
+                              WHERE s.sub_category_code = M_SUB_CATEGORY.sub_category_code);
+        END IF;
+
+        UPDATE M_SUB_CATEGORY msc SET
+            msc.effective_end_date = p_file_date, msc.is_current = 'N',
+            msc.dw_update_ts = SYSTIMESTAMP, msc.expired_by_batch = p_batch_id
+        WHERE msc.effective_end_date = C_HIGH_DATE AND msc.is_current = 'Y'
+          AND EXISTS (
+              SELECT 1 FROM STG_SUB_CATEGORY s
+              WHERE s.sub_category_code = msc.sub_category_code
+                AND STANDARD_HASH(
+                    H(s.sub_category_name)        || C_DELIM ||
+                    H(s.sub_category_description) || C_DELIM ||
+                    H(s.category_code)            || C_DELIM ||
+                    H(s.sub_category_status), 'SHA256') != msc.row_hash);
+        v_expired := SQL%ROWCOUNT;
+
+        INSERT INTO M_SUB_CATEGORY (
+            sub_category_sk, sub_category_code, sub_category_name,
+            sub_category_description, category_code, sub_category_status,
+            row_hash, dim_contributing_hash,
+            effective_start_date, effective_end_date, is_current,
+            source_batch_id, source_file_date, dw_insert_ts, dw_update_ts
+        )
+        SELECT M_SUB_CATEGORY_SK_SEQ.NEXTVAL,
+            s.sub_category_code, s.sub_category_name, s.sub_category_description,
+            s.category_code, s.sub_category_status,
+            STANDARD_HASH(H(s.sub_category_name) || C_DELIM || H(s.sub_category_description)
+                       || C_DELIM || H(s.category_code) || C_DELIM
+                       || H(s.sub_category_status), 'SHA256'),
+            -- All sub-category columns flow into DIM, hashes identical
+            STANDARD_HASH(H(s.sub_category_name) || C_DELIM || H(s.sub_category_description)
+                       || C_DELIM || H(s.category_code) || C_DELIM
+                       || H(s.sub_category_status), 'SHA256'),
+            p_file_date, C_HIGH_DATE, 'Y',
+            p_batch_id, p_file_date, SYSTIMESTAMP, SYSTIMESTAMP
+        FROM STG_SUB_CATEGORY s
+        WHERE NOT EXISTS (SELECT 1 FROM M_SUB_CATEGORY msc
+                          WHERE msc.sub_category_code = s.sub_category_code
+                            AND msc.effective_end_date = C_HIGH_DATE
+                            AND msc.is_current = 'Y');
+        v_inserted := SQL%ROWCOUNT;
+
+        INSERT INTO DW_MASTER_CHANGE_LOG (
+            batch_id, file_date, master_table, natural_key, change_type, logged_ts)
+        SELECT p_batch_id, p_file_date, 'M_SUB_CATEGORY', n.sub_category_code,
+               CASE WHEN o.sub_category_code IS NULL THEN 'INSERT' ELSE 'UPDATE' END,
+               SYSTIMESTAMP
+        FROM M_SUB_CATEGORY n
+        LEFT JOIN M_SUB_CATEGORY o
+            ON o.sub_category_code = n.sub_category_code
+           AND o.effective_end_date = p_file_date AND o.expired_by_batch = p_batch_id
+        WHERE n.source_batch_id = p_batch_id AND n.effective_end_date = C_HIGH_DATE
+          AND (o.sub_category_code IS NULL
+               OR o.dim_contributing_hash != n.dim_contributing_hash);
+
+        COMMIT;
+        p_rows_out := v_inserted;
+        LOG_MSG(p_batch_id, v_proc, 'END expired='||v_expired||' inserted='||v_inserted);
+    EXCEPTION WHEN OTHERS THEN
+        ROLLBACK;
+        LOG_MSG(p_batch_id, v_proc, 'FAILED: '||SQLERRM, 'ERROR'); RAISE;
+    END LOAD_M_SUB_CATEGORY;
+
+    -- =========================================================================
+    -- PRIVATE: LOAD_M_SUPPLIER
+    -- DIM columns: supplier_name, contact_name, contact_email, phone, status
+    -- Non-DIM columns: payment_terms, credit_limit (financial/internal)
+    -- =========================================================================
+    PROCEDURE LOAD_M_SUPPLIER (
+        p_file_date IN DATE,
+        p_batch_id  IN NUMBER,
+        p_load_type IN VARCHAR2,
+        p_rows_out  OUT NUMBER
+    ) IS
+        v_proc     CONSTANT VARCHAR2(50) := 'LOAD_M_SUPPLIER';
+        v_expired  NUMBER := 0;
+        v_inserted NUMBER := 0;
+    BEGIN
+        LOG_MSG(p_batch_id, v_proc, 'START file_date=' || TO_CHAR(p_file_date,'YYYY-MM-DD'));
+
+        IF p_load_type = 'FULL' THEN
+            UPDATE M_SUPPLIER SET
+                effective_end_date = p_file_date, is_current = 'N',
+                dw_update_ts = SYSTIMESTAMP, expired_by_batch = p_batch_id
+            WHERE effective_end_date = C_HIGH_DATE AND is_current = 'Y'
+              AND NOT EXISTS (SELECT 1 FROM STG_SUPPLIER s
+                              WHERE s.supplier_code = M_SUPPLIER.supplier_code);
+        END IF;
+
+        UPDATE M_SUPPLIER ms SET
+            ms.effective_end_date = p_file_date, ms.is_current = 'N',
+            ms.dw_update_ts = SYSTIMESTAMP, ms.expired_by_batch = p_batch_id
+        WHERE ms.effective_end_date = C_HIGH_DATE AND ms.is_current = 'Y'
+          AND EXISTS (
+              SELECT 1 FROM STG_SUPPLIER s
+              WHERE s.supplier_code = ms.supplier_code
+                AND STANDARD_HASH(
+                    H(s.supplier_name)   || C_DELIM || H(s.contact_name)    || C_DELIM ||
+                    H(s.contact_email)   || C_DELIM || H(s.phone)           || C_DELIM ||
+                    H(s.supplier_status) || C_DELIM || H(s.payment_terms)   || C_DELIM ||
+                    H(s.credit_limit), 'SHA256') != ms.row_hash);
+        v_expired := SQL%ROWCOUNT;
+
+        INSERT INTO M_SUPPLIER (
+            supplier_sk, supplier_code, supplier_name, contact_name,
+            contact_email, phone, supplier_status, payment_terms, credit_limit,
+            row_hash, dim_contributing_hash,
+            effective_start_date, effective_end_date, is_current,
+            source_batch_id, source_file_date, dw_insert_ts, dw_update_ts
+        )
+        SELECT M_SUPPLIER_SK_SEQ.NEXTVAL,
+            s.supplier_code, s.supplier_name, s.contact_name, s.contact_email,
+            s.phone, s.supplier_status, s.payment_terms, s.credit_limit,
+            -- Full row hash includes all columns
+            STANDARD_HASH(H(s.supplier_name) || C_DELIM || H(s.contact_name) || C_DELIM ||
+                H(s.contact_email) || C_DELIM || H(s.phone) || C_DELIM ||
+                H(s.supplier_status) || C_DELIM || H(s.payment_terms) || C_DELIM ||
+                H(s.credit_limit), 'SHA256'),
+            -- DIM hash excludes payment_terms and credit_limit
+            STANDARD_HASH(H(s.supplier_name) || C_DELIM || H(s.contact_name) || C_DELIM ||
+                H(s.contact_email) || C_DELIM || H(s.phone) || C_DELIM ||
+                H(s.supplier_status), 'SHA256'),
+            p_file_date, C_HIGH_DATE, 'Y',
+            p_batch_id, p_file_date, SYSTIMESTAMP, SYSTIMESTAMP
+        FROM STG_SUPPLIER s
+        WHERE NOT EXISTS (SELECT 1 FROM M_SUPPLIER ms
+                          WHERE ms.supplier_code = s.supplier_code
+                            AND ms.effective_end_date = C_HIGH_DATE
+                            AND ms.is_current = 'Y');
+        v_inserted := SQL%ROWCOUNT;
+
+        INSERT INTO DW_MASTER_CHANGE_LOG (
+            batch_id, file_date, master_table, natural_key, change_type, logged_ts)
+        SELECT p_batch_id, p_file_date, 'M_SUPPLIER', n.supplier_code,
+               CASE WHEN o.supplier_code IS NULL THEN 'INSERT' ELSE 'UPDATE' END,
+               SYSTIMESTAMP
+        FROM M_SUPPLIER n
+        LEFT JOIN M_SUPPLIER o
+            ON o.supplier_code = n.supplier_code
+           AND o.effective_end_date = p_file_date AND o.expired_by_batch = p_batch_id
+        WHERE n.source_batch_id = p_batch_id AND n.effective_end_date = C_HIGH_DATE
+          AND (o.supplier_code IS NULL
+               OR o.dim_contributing_hash != n.dim_contributing_hash);
+
+        COMMIT;
+        p_rows_out := v_inserted;
+        LOG_MSG(p_batch_id, v_proc, 'END expired='||v_expired||' inserted='||v_inserted);
+    EXCEPTION WHEN OTHERS THEN
+        ROLLBACK;
+        LOG_MSG(p_batch_id, v_proc, 'FAILED: '||SQLERRM, 'ERROR'); RAISE;
+    END LOAD_M_SUPPLIER;
+
+    -- =========================================================================
+    -- PRIVATE: LOAD_M_SUPPLIER_ADDR
+    -- Natural key: supplier_code + addr_type (composite)
+    -- All address columns flow into DIM; row_hash = dim_contributing_hash
+    -- =========================================================================
+    PROCEDURE LOAD_M_SUPPLIER_ADDR (
+        p_file_date IN DATE,
+        p_batch_id  IN NUMBER,
+        p_load_type IN VARCHAR2,
+        p_rows_out  OUT NUMBER
+    ) IS
+        v_proc     CONSTANT VARCHAR2(50) := 'LOAD_M_SUPPLIER_ADDR';
+        v_expired  NUMBER := 0;
+        v_inserted NUMBER := 0;
+    BEGIN
+        LOG_MSG(p_batch_id, v_proc, 'START file_date=' || TO_CHAR(p_file_date,'YYYY-MM-DD'));
+
+        IF p_load_type = 'FULL' THEN
+            UPDATE M_SUPPLIER_ADDR SET
+                effective_end_date = p_file_date, is_current = 'N',
+                dw_update_ts = SYSTIMESTAMP, expired_by_batch = p_batch_id
+            WHERE effective_end_date = C_HIGH_DATE AND is_current = 'Y'
+              AND NOT EXISTS (SELECT 1 FROM STG_SUPPLIER_ADDR s
+                              WHERE s.supplier_code = M_SUPPLIER_ADDR.supplier_code
+                                AND s.addr_type     = M_SUPPLIER_ADDR.addr_type);
+        END IF;
+
+        UPDATE M_SUPPLIER_ADDR msa SET
+            msa.effective_end_date = p_file_date, msa.is_current = 'N',
+            msa.dw_update_ts = SYSTIMESTAMP, msa.expired_by_batch = p_batch_id
+        WHERE msa.effective_end_date = C_HIGH_DATE AND msa.is_current = 'Y'
+          AND EXISTS (
+              SELECT 1 FROM STG_SUPPLIER_ADDR s
+              WHERE s.supplier_code = msa.supplier_code AND s.addr_type = msa.addr_type
+                AND STANDARD_HASH(
+                    H(s.address_line1) || C_DELIM || H(s.address_line2) || C_DELIM ||
+                    H(s.city) || C_DELIM || H(s.state) || C_DELIM ||
+                    H(s.country) || C_DELIM || H(s.postal_code), 'SHA256') != msa.row_hash);
+        v_expired := SQL%ROWCOUNT;
+
+        INSERT INTO M_SUPPLIER_ADDR (
+            supplier_addr_sk, supplier_code, addr_type,
+            address_line1, address_line2, city, state, country, postal_code,
+            row_hash, dim_contributing_hash,
+            effective_start_date, effective_end_date, is_current,
+            source_batch_id, source_file_date, dw_insert_ts, dw_update_ts
+        )
+        SELECT M_SUPPLIER_ADDR_SK_SEQ.NEXTVAL,
+            s.supplier_code, s.addr_type, s.address_line1, s.address_line2,
+            s.city, s.state, s.country, s.postal_code,
+            STANDARD_HASH(H(s.address_line1) || C_DELIM || H(s.address_line2) || C_DELIM ||
+                H(s.city) || C_DELIM || H(s.state) || C_DELIM ||
+                H(s.country) || C_DELIM || H(s.postal_code), 'SHA256'),
+            STANDARD_HASH(H(s.address_line1) || C_DELIM || H(s.address_line2) || C_DELIM ||
+                H(s.city) || C_DELIM || H(s.state) || C_DELIM ||
+                H(s.country) || C_DELIM || H(s.postal_code), 'SHA256'),
+            p_file_date, C_HIGH_DATE, 'Y',
+            p_batch_id, p_file_date, SYSTIMESTAMP, SYSTIMESTAMP
+        FROM STG_SUPPLIER_ADDR s
+        WHERE NOT EXISTS (SELECT 1 FROM M_SUPPLIER_ADDR msa
+                          WHERE msa.supplier_code = s.supplier_code
+                            AND msa.addr_type     = s.addr_type
+                            AND msa.effective_end_date = C_HIGH_DATE
+                            AND msa.is_current = 'Y');
+        v_inserted := SQL%ROWCOUNT;
+
+        -- Composite natural key stored as pipe-delimited string
+        INSERT INTO DW_MASTER_CHANGE_LOG (
+            batch_id, file_date, master_table, natural_key, change_type, logged_ts)
+        SELECT p_batch_id, p_file_date, 'M_SUPPLIER_ADDR',
+               n.supplier_code || '|' || n.addr_type,
+               CASE WHEN o.supplier_code IS NULL THEN 'INSERT' ELSE 'UPDATE' END,
+               SYSTIMESTAMP
+        FROM M_SUPPLIER_ADDR n
+        LEFT JOIN M_SUPPLIER_ADDR o
+            ON o.supplier_code = n.supplier_code AND o.addr_type = n.addr_type
+           AND o.effective_end_date = p_file_date AND o.expired_by_batch = p_batch_id
+        WHERE n.source_batch_id = p_batch_id AND n.effective_end_date = C_HIGH_DATE
+          AND (o.supplier_code IS NULL
+               OR o.dim_contributing_hash != n.dim_contributing_hash);
+
+        COMMIT;
+        p_rows_out := v_inserted;
+        LOG_MSG(p_batch_id, v_proc, 'END expired='||v_expired||' inserted='||v_inserted);
+    EXCEPTION WHEN OTHERS THEN
+        ROLLBACK;
+        LOG_MSG(p_batch_id, v_proc, 'FAILED: '||SQLERRM, 'ERROR'); RAISE;
+    END LOAD_M_SUPPLIER_ADDR;
+
+    -- =========================================================================
+    -- PRIVATE: LOAD_M_BRAND
+    -- DIM columns: brand_name, brand_owner, brand_status
+    -- Non-DIM columns: brand_tier (internal classification)
+    -- =========================================================================
+    PROCEDURE LOAD_M_BRAND (
+        p_file_date IN DATE,
+        p_batch_id  IN NUMBER,
+        p_load_type IN VARCHAR2,
+        p_rows_out  OUT NUMBER
+    ) IS
+        v_proc     CONSTANT VARCHAR2(50) := 'LOAD_M_BRAND';
+        v_expired  NUMBER := 0;
+        v_inserted NUMBER := 0;
+    BEGIN
+        LOG_MSG(p_batch_id, v_proc, 'START file_date=' || TO_CHAR(p_file_date,'YYYY-MM-DD'));
+
+        IF p_load_type = 'FULL' THEN
+            UPDATE M_BRAND SET
+                effective_end_date = p_file_date, is_current = 'N',
+                dw_update_ts = SYSTIMESTAMP, expired_by_batch = p_batch_id
+            WHERE effective_end_date = C_HIGH_DATE AND is_current = 'Y'
+              AND NOT EXISTS (SELECT 1 FROM STG_BRAND s
+                              WHERE s.brand_code = M_BRAND.brand_code);
+        END IF;
+
+        UPDATE M_BRAND mb SET
+            mb.effective_end_date = p_file_date, mb.is_current = 'N',
+            mb.dw_update_ts = SYSTIMESTAMP, mb.expired_by_batch = p_batch_id
+        WHERE mb.effective_end_date = C_HIGH_DATE AND mb.is_current = 'Y'
+          AND EXISTS (
+              SELECT 1 FROM STG_BRAND s
+              WHERE s.brand_code = mb.brand_code
+                AND STANDARD_HASH(
+                    H(s.brand_name)   || C_DELIM || H(s.brand_owner)  || C_DELIM ||
+                    H(s.brand_status) || C_DELIM || H(s.brand_tier), 'SHA256') != mb.row_hash);
+        v_expired := SQL%ROWCOUNT;
+
+        INSERT INTO M_BRAND (
+            brand_sk, brand_code, brand_name, brand_owner, brand_status, brand_tier,
+            row_hash, dim_contributing_hash,
+            effective_start_date, effective_end_date, is_current,
+            source_batch_id, source_file_date, dw_insert_ts, dw_update_ts
+        )
+        SELECT M_BRAND_SK_SEQ.NEXTVAL,
+            s.brand_code, s.brand_name, s.brand_owner, s.brand_status, s.brand_tier,
+            STANDARD_HASH(H(s.brand_name) || C_DELIM || H(s.brand_owner) || C_DELIM ||
+                H(s.brand_status) || C_DELIM || H(s.brand_tier), 'SHA256'),
+            -- brand_tier excluded from DIM hash
+            STANDARD_HASH(H(s.brand_name) || C_DELIM || H(s.brand_owner) || C_DELIM ||
+                H(s.brand_status), 'SHA256'),
+            p_file_date, C_HIGH_DATE, 'Y',
+            p_batch_id, p_file_date, SYSTIMESTAMP, SYSTIMESTAMP
+        FROM STG_BRAND s
+        WHERE NOT EXISTS (SELECT 1 FROM M_BRAND mb
+                          WHERE mb.brand_code = s.brand_code
+                            AND mb.effective_end_date = C_HIGH_DATE
+                            AND mb.is_current = 'Y');
+        v_inserted := SQL%ROWCOUNT;
+
+        INSERT INTO DW_MASTER_CHANGE_LOG (
+            batch_id, file_date, master_table, natural_key, change_type, logged_ts)
+        SELECT p_batch_id, p_file_date, 'M_BRAND', n.brand_code,
+               CASE WHEN o.brand_code IS NULL THEN 'INSERT' ELSE 'UPDATE' END,
+               SYSTIMESTAMP
+        FROM M_BRAND n
+        LEFT JOIN M_BRAND o
+            ON o.brand_code = n.brand_code
+           AND o.effective_end_date = p_file_date AND o.expired_by_batch = p_batch_id
+        WHERE n.source_batch_id = p_batch_id AND n.effective_end_date = C_HIGH_DATE
+          AND (o.brand_code IS NULL
+               OR o.dim_contributing_hash != n.dim_contributing_hash);
+
+        COMMIT;
+        p_rows_out := v_inserted;
+        LOG_MSG(p_batch_id, v_proc, 'END expired='||v_expired||' inserted='||v_inserted);
+    EXCEPTION WHEN OTHERS THEN
+        ROLLBACK;
+        LOG_MSG(p_batch_id, v_proc, 'FAILED: '||SQLERRM, 'ERROR'); RAISE;
+    END LOAD_M_BRAND;
+
+    -- =========================================================================
+    -- PRIVATE: LOAD_M_UOM
+    -- DIM columns: uom_description, conversion_factor, base_uom_code
+    -- Non-DIM columns: uom_type (internal classification)
+    -- =========================================================================
+    PROCEDURE LOAD_M_UOM (
+        p_file_date IN DATE,
+        p_batch_id  IN NUMBER,
+        p_load_type IN VARCHAR2,
+        p_rows_out  OUT NUMBER
+    ) IS
+        v_proc     CONSTANT VARCHAR2(50) := 'LOAD_M_UOM';
+        v_expired  NUMBER := 0;
+        v_inserted NUMBER := 0;
+    BEGIN
+        LOG_MSG(p_batch_id, v_proc, 'START file_date=' || TO_CHAR(p_file_date,'YYYY-MM-DD'));
+
+        IF p_load_type = 'FULL' THEN
+            UPDATE M_UOM SET
+                effective_end_date = p_file_date, is_current = 'N',
+                dw_update_ts = SYSTIMESTAMP, expired_by_batch = p_batch_id
+            WHERE effective_end_date = C_HIGH_DATE AND is_current = 'Y'
+              AND NOT EXISTS (SELECT 1 FROM STG_UOM s
+                              WHERE s.uom_code = M_UOM.uom_code);
+        END IF;
+
+        UPDATE M_UOM mu SET
+            mu.effective_end_date = p_file_date, mu.is_current = 'N',
+            mu.dw_update_ts = SYSTIMESTAMP, mu.expired_by_batch = p_batch_id
+        WHERE mu.effective_end_date = C_HIGH_DATE AND mu.is_current = 'Y'
+          AND EXISTS (
+              SELECT 1 FROM STG_UOM s
+              WHERE s.uom_code = mu.uom_code
+                AND STANDARD_HASH(
+                    H(s.uom_description) || C_DELIM || H(s.uom_type) || C_DELIM ||
+                    H(s.conversion_factor) || C_DELIM || H(s.base_uom_code), 'SHA256')
+                    != mu.row_hash);
+        v_expired := SQL%ROWCOUNT;
+
+        INSERT INTO M_UOM (
+            uom_sk, uom_code, uom_description, uom_type,
+            conversion_factor, base_uom_code,
+            row_hash, dim_contributing_hash,
+            effective_start_date, effective_end_date, is_current,
+            source_batch_id, source_file_date, dw_insert_ts, dw_update_ts
+        )
+        SELECT M_UOM_SK_SEQ.NEXTVAL,
+            s.uom_code, s.uom_description, s.uom_type, s.conversion_factor, s.base_uom_code,
+            STANDARD_HASH(H(s.uom_description) || C_DELIM || H(s.uom_type) || C_DELIM ||
+                H(s.conversion_factor) || C_DELIM || H(s.base_uom_code), 'SHA256'),
+            -- uom_type excluded from DIM hash
+            STANDARD_HASH(H(s.uom_description) || C_DELIM ||
+                H(s.conversion_factor) || C_DELIM || H(s.base_uom_code), 'SHA256'),
+            p_file_date, C_HIGH_DATE, 'Y',
+            p_batch_id, p_file_date, SYSTIMESTAMP, SYSTIMESTAMP
+        FROM STG_UOM s
+        WHERE NOT EXISTS (SELECT 1 FROM M_UOM mu
+                          WHERE mu.uom_code = s.uom_code
+                            AND mu.effective_end_date = C_HIGH_DATE
+                            AND mu.is_current = 'Y');
+        v_inserted := SQL%ROWCOUNT;
+
+        INSERT INTO DW_MASTER_CHANGE_LOG (
+            batch_id, file_date, master_table, natural_key, change_type, logged_ts)
+        SELECT p_batch_id, p_file_date, 'M_UOM', n.uom_code,
+               CASE WHEN o.uom_code IS NULL THEN 'INSERT' ELSE 'UPDATE' END,
+               SYSTIMESTAMP
+        FROM M_UOM n
+        LEFT JOIN M_UOM o
+            ON o.uom_code = n.uom_code
+           AND o.effective_end_date = p_file_date AND o.expired_by_batch = p_batch_id
+        WHERE n.source_batch_id = p_batch_id AND n.effective_end_date = C_HIGH_DATE
+          AND (o.uom_code IS NULL
+               OR o.dim_contributing_hash != n.dim_contributing_hash);
+
+        COMMIT;
+        p_rows_out := v_inserted;
+        LOG_MSG(p_batch_id, v_proc, 'END expired='||v_expired||' inserted='||v_inserted);
+    EXCEPTION WHEN OTHERS THEN
+        ROLLBACK;
+        LOG_MSG(p_batch_id, v_proc, 'FAILED: '||SQLERRM, 'ERROR'); RAISE;
+    END LOAD_M_UOM;
+
+    -- =========================================================================
+    -- PRIVATE: LOAD_M_PRODUCT
+    -- Loaded last; references all 6 tables above.
+    -- DIM columns: name, description, status, launch_date, discontinue_date,
+    --              category_code, sub_category_code, supplier_code,
+    --              brand_code, base_uom_code
+    -- Non-DIM columns: weight_uom_code, unit_weight, unit_volume
+    -- =========================================================================
+    PROCEDURE LOAD_M_PRODUCT (
+        p_file_date IN DATE,
+        p_batch_id  IN NUMBER,
+        p_load_type IN VARCHAR2,
+        p_rows_out  OUT NUMBER
+    ) IS
+        v_proc     CONSTANT VARCHAR2(50) := 'LOAD_M_PRODUCT';
+        v_expired  NUMBER := 0;
+        v_inserted NUMBER := 0;
+    BEGIN
+        LOG_MSG(p_batch_id, v_proc, 'START file_date=' || TO_CHAR(p_file_date,'YYYY-MM-DD'));
+
+        IF p_load_type = 'FULL' THEN
+            UPDATE M_PRODUCT SET
+                effective_end_date = p_file_date, is_current = 'N',
+                dw_update_ts = SYSTIMESTAMP, expired_by_batch = p_batch_id
+            WHERE effective_end_date = C_HIGH_DATE AND is_current = 'Y'
+              AND NOT EXISTS (SELECT 1 FROM STG_PRODUCT s
+                              WHERE s.product_code = M_PRODUCT.product_code);
+        END IF;
+
+        UPDATE M_PRODUCT mp SET
+            mp.effective_end_date = p_file_date, mp.is_current = 'N',
+            mp.dw_update_ts = SYSTIMESTAMP, mp.expired_by_batch = p_batch_id
+        WHERE mp.effective_end_date = C_HIGH_DATE AND mp.is_current = 'Y'
+          AND EXISTS (
+              SELECT 1 FROM STG_PRODUCT s
+              WHERE s.product_code = mp.product_code
+                AND STANDARD_HASH(
+                    H(s.product_name)        || C_DELIM || H(s.product_description) || C_DELIM ||
+                    H(s.product_status)      || C_DELIM || H(s.launch_date)          || C_DELIM ||
+                    H(s.discontinue_date)    || C_DELIM || H(s.category_code)        || C_DELIM ||
+                    H(s.sub_category_code)   || C_DELIM || H(s.supplier_code)        || C_DELIM ||
+                    H(s.brand_code)          || C_DELIM || H(s.base_uom_code)        || C_DELIM ||
+                    H(s.weight_uom_code)     || C_DELIM || H(s.unit_weight)          || C_DELIM ||
+                    H(s.unit_volume), 'SHA256') != mp.row_hash);
+        v_expired := SQL%ROWCOUNT;
+
+        INSERT INTO M_PRODUCT (
+            product_sk, product_code, product_name, product_description,
+            product_status, launch_date, discontinue_date,
+            category_code, sub_category_code, supplier_code,
+            brand_code, base_uom_code, weight_uom_code, unit_weight, unit_volume,
+            row_hash, dim_contributing_hash,
+            effective_start_date, effective_end_date, is_current,
+            source_batch_id, source_file_date, dw_insert_ts, dw_update_ts
+        )
+        SELECT M_PRODUCT_SK_SEQ.NEXTVAL,
+            s.product_code, s.product_name, s.product_description,
+            s.product_status, s.launch_date, s.discontinue_date,
+            s.category_code, s.sub_category_code, s.supplier_code,
+            s.brand_code, s.base_uom_code, s.weight_uom_code,
+            s.unit_weight, s.unit_volume,
+            -- Full row hash: all columns
+            STANDARD_HASH(
+                H(s.product_name)      || C_DELIM || H(s.product_description) || C_DELIM ||
+                H(s.product_status)    || C_DELIM || H(s.launch_date)         || C_DELIM ||
+                H(s.discontinue_date)  || C_DELIM || H(s.category_code)       || C_DELIM ||
+                H(s.sub_category_code) || C_DELIM || H(s.supplier_code)       || C_DELIM ||
+                H(s.brand_code)        || C_DELIM || H(s.base_uom_code)       || C_DELIM ||
+                H(s.weight_uom_code)   || C_DELIM || H(s.unit_weight)         || C_DELIM ||
+                H(s.unit_volume), 'SHA256'),
+            -- DIM hash: excludes weight_uom_code, unit_weight, unit_volume
+            STANDARD_HASH(
+                H(s.product_name)      || C_DELIM || H(s.product_description) || C_DELIM ||
+                H(s.product_status)    || C_DELIM || H(s.launch_date)         || C_DELIM ||
+                H(s.discontinue_date)  || C_DELIM || H(s.category_code)       || C_DELIM ||
+                H(s.sub_category_code) || C_DELIM || H(s.supplier_code)       || C_DELIM ||
+                H(s.brand_code)        || C_DELIM || H(s.base_uom_code), 'SHA256'),
+            p_file_date, C_HIGH_DATE, 'Y',
+            p_batch_id, p_file_date, SYSTIMESTAMP, SYSTIMESTAMP
+        FROM STG_PRODUCT s
+        WHERE NOT EXISTS (SELECT 1 FROM M_PRODUCT mp
+                          WHERE mp.product_code = s.product_code
+                            AND mp.effective_end_date = C_HIGH_DATE
+                            AND mp.is_current = 'Y');
+        v_inserted := SQL%ROWCOUNT;
+
+        INSERT INTO DW_MASTER_CHANGE_LOG (
+            batch_id, file_date, master_table, natural_key, change_type, logged_ts)
+        SELECT p_batch_id, p_file_date, 'M_PRODUCT', n.product_code,
+               CASE WHEN o.product_code IS NULL THEN 'INSERT' ELSE 'UPDATE' END,
+               SYSTIMESTAMP
+        FROM M_PRODUCT n
+        LEFT JOIN M_PRODUCT o
+            ON o.product_code = n.product_code
+           AND o.effective_end_date = p_file_date AND o.expired_by_batch = p_batch_id
+        WHERE n.source_batch_id = p_batch_id AND n.effective_end_date = C_HIGH_DATE
+          AND (o.product_code IS NULL
+               OR o.dim_contributing_hash != n.dim_contributing_hash);
+
+        COMMIT;
+        p_rows_out := v_inserted;
+        LOG_MSG(p_batch_id, v_proc, 'END expired='||v_expired||' inserted='||v_inserted);
+    EXCEPTION WHEN OTHERS THEN
+        ROLLBACK;
+        LOG_MSG(p_batch_id, v_proc, 'FAILED: '||SQLERRM, 'ERROR'); RAISE;
+    END LOAD_M_PRODUCT;
+
+    -- =========================================================================
+    -- PUBLIC: LOAD_ALL_MASTERS_FOR_DATE
+    -- Reference tables loaded before M_PRODUCT to maintain integrity.
+    -- =========================================================================
+    PROCEDURE LOAD_ALL_MASTERS_FOR_DATE (
+        p_file_date IN DATE,
+        p_batch_id  IN NUMBER,
+        p_load_type IN VARCHAR2 DEFAULT 'DELTA'
+    ) IS
+        v_proc   CONSTANT VARCHAR2(50) := 'LOAD_ALL_MASTERS_FOR_DATE';
+        v_rows   NUMBER := 0;
+        v_total  NUMBER := 0;
+    BEGIN
+        LOG_MSG(p_batch_id, v_proc,
+            'START file_date='||TO_CHAR(p_file_date,'YYYY-MM-DD')||' load_type='||p_load_type);
+        UPDATE_BATCH_STATUS(p_batch_id, p_file_date, C_STATUS_RUN);
+
+        LOAD_M_CATEGORY      (p_file_date, p_batch_id, p_load_type, v_rows); v_total := v_total + v_rows;
+        LOAD_M_SUB_CATEGORY  (p_file_date, p_batch_id, p_load_type, v_rows); v_total := v_total + v_rows;
+        LOAD_M_SUPPLIER      (p_file_date, p_batch_id, p_load_type, v_rows); v_total := v_total + v_rows;
+        LOAD_M_SUPPLIER_ADDR (p_file_date, p_batch_id, p_load_type, v_rows); v_total := v_total + v_rows;
+        LOAD_M_BRAND         (p_file_date, p_batch_id, p_load_type, v_rows); v_total := v_total + v_rows;
+        LOAD_M_UOM           (p_file_date, p_batch_id, p_load_type, v_rows); v_total := v_total + v_rows;
+        LOAD_M_PRODUCT       (p_file_date, p_batch_id, p_load_type, v_rows); v_total := v_total + v_rows;
+
+        UPDATE_BATCH_STATUS(p_batch_id, p_file_date, C_STATUS_DONE, v_total);
+        LOG_MSG(p_batch_id, v_proc, 'END total_inserted='||v_total);
+    EXCEPTION WHEN OTHERS THEN
+        ROLLBACK;
+        UPDATE_BATCH_STATUS(p_batch_id, p_file_date, C_STATUS_FAIL, 0, SQLERRM);
+        LOG_MSG(p_batch_id, v_proc, 'FAILED: '||SQLERRM, 'ERROR'); RAISE;
+    END LOAD_ALL_MASTERS_FOR_DATE;
+
+    -- =========================================================================
+    -- PUBLIC: CATCHUP_MASTER_LOAD  (Scenario 1)
+    -- Finds file dates where STAGING=COMPLETED but MASTER!=COMPLETED.
+    -- Processes in strict date order; aborts on first failure.
+    -- =========================================================================
+    PROCEDURE CATCHUP_MASTER_LOAD (
+        p_from_date IN DATE DEFAULT NULL,
+        p_to_date   IN DATE DEFAULT TRUNC(SYSDATE)
+    ) IS
+        v_proc      CONSTANT VARCHAR2(50) := 'CATCHUP_MASTER_LOAD';
+        v_from_date DATE;
+        v_load_type VARCHAR2(10);
+        v_prev_cnt  NUMBER;
+
+        CURSOR c_pending IS
+            SELECT bc_stg.file_date, bc_stg.batch_id
+            FROM DW_BATCH_CONTROL bc_stg
+            WHERE bc_stg.layer    = C_STG_LAYER
+              AND bc_stg.status   = C_STATUS_DONE
+              AND bc_stg.file_date >= v_from_date
+              AND bc_stg.file_date <= p_to_date
+              AND NOT EXISTS (SELECT 1 FROM DW_BATCH_CONTROL bc_m
+                              WHERE bc_m.batch_id = bc_stg.batch_id
+                                AND bc_m.layer    = C_MASTER_LAYER
+                                AND bc_m.status   = C_STATUS_DONE)
+            ORDER BY bc_stg.file_date ASC;
+    BEGIN
+        IF p_from_date IS NULL THEN
+            SELECT NVL(MIN(bc.file_date), p_to_date) INTO v_from_date
+            FROM DW_BATCH_CONTROL bc
+            WHERE bc.layer = C_STG_LAYER AND bc.status = C_STATUS_DONE
+              AND NOT EXISTS (SELECT 1 FROM DW_BATCH_CONTROL bc_m
+                              WHERE bc_m.batch_id = bc.batch_id
+                                AND bc_m.layer    = C_MASTER_LAYER
+                                AND bc_m.status   = C_STATUS_DONE);
+        ELSE
+            v_from_date := p_from_date;
+        END IF;
+
+        LOG_MSG(-1, v_proc, 'START from='||TO_CHAR(v_from_date,'YYYY-MM-DD')
+                          ||' to='||TO_CHAR(p_to_date,'YYYY-MM-DD'));
+
+        FOR r IN c_pending LOOP
+            BEGIN
+                SELECT COUNT(*) INTO v_prev_cnt
+                FROM DW_BATCH_CONTROL
+                WHERE layer = C_MASTER_LAYER AND status = C_STATUS_DONE
+                  AND file_date < r.file_date;
+                v_load_type := CASE WHEN v_prev_cnt = 0 THEN 'FULL' ELSE 'DELTA' END;
+
+                LOAD_ALL_MASTERS_FOR_DATE(r.file_date, r.batch_id, v_load_type);
+            EXCEPTION WHEN OTHERS THEN
+                LOG_MSG(r.batch_id, v_proc,
+                    'ABORTED at '||TO_CHAR(r.file_date,'YYYY-MM-DD')||': '||SQLERRM, 'ERROR');
+                RAISE;
+            END;
+        END LOOP;
+
+        LOG_MSG(-1, v_proc, 'COMPLETE');
+    END CATCHUP_MASTER_LOAD;
+
+    -- =========================================================================
+    -- PUBLIC: REPLAY_MASTER_FROM_DATE  (Scenario 2)
+    -- Rolls back all 7 master tables to pre-corruption state,
+    -- then replays each file date using corrected staging data.
+    -- =========================================================================
+    PROCEDURE REPLAY_MASTER_FROM_DATE (
+        p_from_date IN DATE,
+        p_to_date   IN DATE DEFAULT TRUNC(SYSDATE)
+    ) IS
+        v_proc CONSTANT VARCHAR2(50) := 'REPLAY_MASTER_FROM_DATE';
+
+        PROCEDURE ROLLBACK_ONE (p_tbl IN VARCHAR2) IS
+        BEGIN
+            EXECUTE IMMEDIATE 'DELETE FROM '||p_tbl
+                ||' WHERE effective_start_date >= :1' USING p_from_date;
+            LOG_MSG(-1, v_proc, 'Deleted from '||p_tbl||' rows='||SQL%ROWCOUNT);
+
+            EXECUTE IMMEDIATE
+                'UPDATE '||p_tbl
+                ||' SET effective_end_date = DATE ''9999-12-31'''
+                ||'   , is_current         = ''Y'''
+                ||'   , dw_update_ts       = SYSTIMESTAMP'
+                ||' WHERE effective_end_date >= :1'
+                ||'   AND effective_end_date <  DATE ''9999-12-31'''
+                ||'   AND effective_start_date < :2'
+                USING p_from_date, p_from_date;
+            LOG_MSG(-1, v_proc, 'Re-opened in '||p_tbl||' rows='||SQL%ROWCOUNT);
+        END ROLLBACK_ONE;
+
+        CURSOR c_replay IS
+            SELECT bc.file_date, bc.batch_id
+            FROM DW_BATCH_CONTROL bc
+            WHERE bc.layer = C_STG_LAYER AND bc.status = C_STATUS_DONE
+              AND bc.file_date >= p_from_date AND bc.file_date <= p_to_date
+            ORDER BY bc.file_date ASC;
+    BEGIN
+        LOG_MSG(-1, v_proc, 'START from='||TO_CHAR(p_from_date,'YYYY-MM-DD')
+                          ||' to='||TO_CHAR(p_to_date,'YYYY-MM-DD'));
+
+        -- Roll back in dependency order: dependants first, then references
+        ROLLBACK_ONE('M_PRODUCT');
+        ROLLBACK_ONE('M_CATEGORY');
+        ROLLBACK_ONE('M_SUB_CATEGORY');
+        ROLLBACK_ONE('M_SUPPLIER');
+        ROLLBACK_ONE('M_SUPPLIER_ADDR');
+        ROLLBACK_ONE('M_BRAND');
+        ROLLBACK_ONE('M_UOM');
+
+        DELETE FROM DW_MASTER_CHANGE_LOG
+        WHERE file_date >= p_from_date AND file_date <= p_to_date;
+
+        UPDATE DW_BATCH_CONTROL
+        SET status = C_STATUS_PEND, updated_ts = SYSTIMESTAMP
+        WHERE layer = C_MASTER_LAYER
+          AND file_date >= p_from_date AND file_date <= p_to_date;
+
+        COMMIT;
+        LOG_MSG(-1, v_proc, 'Rollback complete. Starting replay.');
+
+        FOR r IN c_replay LOOP
+            BEGIN
+                LOAD_ALL_MASTERS_FOR_DATE(r.file_date, r.batch_id, 'DELTA');
+            EXCEPTION WHEN OTHERS THEN
+                LOG_MSG(r.batch_id, v_proc,
+                    'ABORTED at '||TO_CHAR(r.file_date,'YYYY-MM-DD')||': '||SQLERRM, 'ERROR');
+                RAISE;
+            END;
+        END LOOP;
+
+        LOG_MSG(-1, v_proc, 'Replay COMPLETE');
+    EXCEPTION WHEN OTHERS THEN
+        ROLLBACK;
+        LOG_MSG(-1, v_proc, 'FAILED in rollback phase: '||SQLERRM, 'ERROR'); RAISE;
+    END REPLAY_MASTER_FROM_DATE;
+
+END PKG_MASTER_LOAD;
+/
